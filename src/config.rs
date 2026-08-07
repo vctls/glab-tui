@@ -5,6 +5,12 @@ use std::path::PathBuf;
 use std::sync::LazyLock as Lazy;
 use std::sync::RwLock;
 
+/// Serializes tests that mutate process-global environment variables
+/// (config paths, cache dirs). Env vars are visible to every test thread,
+/// so mutating ones must never overlap with a load in another.
+#[cfg(test)]
+pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     pub bg: Color,
@@ -259,7 +265,7 @@ pub enum SaveMenu {
     Cancel,
 }
 
-fn hex_to_color(s: &str) -> Option<Color> {
+pub(crate) fn hex_to_color(s: &str) -> Option<Color> {
     let s = s.trim_start_matches('#');
     if s.len() == 6 {
         let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -425,11 +431,11 @@ impl ThemeToml {
                 hex_or(&self.label_palette_2, green),
                 hex_or(&self.label_palette_3, yellow),
                 hex_or(&self.label_palette_4, red),
-                hex_or(&self.label_palette_5, Color::Rgb(240, 140, 180)),
-                hex_or(&self.label_palette_6, Color::Rgb(250, 120, 80)),
-                hex_or(&self.label_palette_7, Color::Rgb(40, 200, 200)),
-                hex_or(&self.label_palette_8, Color::Rgb(180, 230, 40)),
-                hex_or(&self.label_palette_9, Color::Rgb(220, 160, 255)),
+                hex_or(&self.label_palette_5, purple),
+                hex_or(&self.label_palette_6, blue),
+                hex_or(&self.label_palette_7, green),
+                hex_or(&self.label_palette_8, yellow),
+                hex_or(&self.label_palette_9, red),
             ],
         })
     }
@@ -455,6 +461,9 @@ const BUNDLED_THEMES: &[(&str, &str)] = &[
         "everforest-dark",
         include_str!("themes/everforest-dark.toml"),
     ),
+    ("rose-pine", include_str!("themes/rose-pine.toml")),
+    ("rose-pine-moon", include_str!("themes/rose-pine-moon.toml")),
+    ("rose-pine-dawn", include_str!("themes/rose-pine-dawn.toml")),
 ];
 
 fn config_dir() -> PathBuf {
@@ -493,57 +502,18 @@ fn ensure_themes() {
     }
 }
 
-#[rustfmt::skip]
+impl Default for Theme {
+    fn default() -> Self {
+        toml::from_str::<ThemeToml>(include_str!("themes/default.toml"))
+            .expect("Bundled default.toml must be valid")
+            .to_theme()
+            .expect("Bundled default.toml must map to valid Theme")
+    }
+}
+
 impl Theme {
     pub fn default() -> Self {
-        Self {
-            bg:               Color::Rgb(18, 18, 20),
-            border:           Color::Rgb(80, 80, 88),
-            border_focused:   Color::Rgb(49, 191, 103),
-            header_fg:        Color::Rgb(49, 191, 103),
-            highlight_bg:     Color::Rgb(43, 43, 57),
-            inactive_bg:      Color::Rgb(49, 50, 68),
-            text_normal:      Color::Rgb(216, 222, 233),
-            text_muted:       Color::Rgb(130, 130, 138),
-            checked_bg:       Color::Rgb(28, 38, 55),
-            green:            Color::Rgb(49, 191, 103),
-            green_bg:         Color::Rgb(20, 45, 28),
-            red:              Color::Rgb(224, 73, 83),
-            red_bg:           Color::Rgb(50, 20, 25),
-            blue:             Color::Rgb(61, 139, 255),
-            blue_bg:          Color::Rgb(15, 35, 60),
-            yellow:           Color::Rgb(235, 180, 50),
-            yellow_bg:        Color::Rgb(45, 35, 15),
-            purple:           Color::Rgb(168, 122, 243),
-            purple_bg:        Color::Rgb(38, 25, 55),
-            diff_addition_fg: Color::Rgb(49, 191, 103),
-            diff_addition_bg: Color::Rgb(20, 45, 28),
-            diff_deletion_fg: Color::Rgb(224, 73, 83),
-            diff_deletion_bg: Color::Rgb(50, 20, 25),
-            diff_gutter_bg:   Color::Rgb(35, 35, 45),
-            diff_sep:         Color::Rgb(130, 130, 138),
-            comment_bg:       Color::Rgb(43, 43, 57),
-            comment_draft_bg: Color::Rgb(45, 35, 15),
-            modal_border:     Color::Rgb(49, 191, 103),
-            pipeline_success: Color::Rgb(49, 191, 103),
-            pipeline_failed:  Color::Rgb(224, 73, 83),
-            pipeline_running: Color::Rgb(61, 139, 255),
-            pipeline_pending: Color::Rgb(235, 180, 50),
-            pipeline_canceled:Color::Rgb(130, 130, 138),
-            pipeline_skipped: Color::Rgb(130, 130, 138),
-            label_palette: [
-                Color::Rgb(168, 122, 243),
-                Color::Rgb(61, 139, 255),
-                Color::Rgb(49, 191, 103),
-                Color::Rgb(235, 180, 50),
-                Color::Rgb(224, 73, 83),
-                Color::Rgb(240, 140, 180),
-                Color::Rgb(250, 120, 80),
-                Color::Rgb(40, 200, 200),
-                Color::Rgb(180, 230, 40),
-                Color::Rgb(220, 160, 255),
-            ],
-        }
+        Default::default()
     }
 
     pub fn preset(name: &str) -> Option<Self> {
@@ -562,7 +532,6 @@ impl Theme {
             .find(|(n, _)| *n == name)
             .and_then(|(_, toml_str)| toml::from_str::<ThemeToml>(toml_str).ok())
             .and_then(|tf| tf.to_theme())
-            .or_else(|| (name == "default").then(Self::default))
     }
 }
 
@@ -1129,6 +1098,10 @@ fn def_api_per_page() -> usize {
     100
 }
 
+fn def_fetch_label_colors() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -1158,6 +1131,10 @@ pub struct Config {
     pub page_size: usize,
     #[serde(default = "def_api_per_page")]
     pub api_per_page: usize,
+    /// Use real label colors from `label list` when available; otherwise use
+    /// the theme palette as fallback.
+    #[serde(default = "def_fetch_label_colors")]
+    pub fetch_label_colors: bool,
     pub disabled_tabs: Option<Vec<String>>,
     pub ui: UiConfig,
     pub issues: PaneConfig,
@@ -1182,6 +1159,7 @@ impl Default for Config {
             keybindings: KeybindingConfig::default(),
             page_size: def_page_size(),
             api_per_page: def_api_per_page(),
+            fetch_label_colors: def_fetch_label_colors(),
             disabled_tabs: None,
             ui: UiConfig::default(),
             issues: PaneConfig::default(),
@@ -1219,7 +1197,8 @@ impl Config {
 # See https://github.com/rcieri/glab-tui for documentation
 
 # Theme preset: "default", "tokyo-night", "gruvbox", "nord", "catppuccin-mocha", "dracula",
-# "deep-space", "solarized-dark", "monokai", "one-dark", "synthwave-84", "everforest-dark"
+# "deep-space", "solarized-dark", "monokai", "one-dark", "synthwave-84", "everforest-dark",
+# "rose-pine", "rose-pine-moon", "rose-pine-dawn"
 theme_preset = "default"
 
 # Default request page size
@@ -1478,21 +1457,10 @@ pub static THEME: Lazy<RwLock<Theme>> = Lazy::new(|| RwLock::new(Config::load().
 pub static ICONS: Lazy<RwLock<Icons>> = Lazy::new(|| RwLock::new(Icons::default()));
 
 pub fn all_theme_presets() -> Vec<String> {
-    let mut presets: Vec<String> = vec![
-        "default".into(),
-        "clean".into(),
-        "tokyo-night".into(),
-        "gruvbox".into(),
-        "nord".into(),
-        "catppuccin-mocha".into(),
-        "dracula".into(),
-        "deep-space".into(),
-        "solarized-dark".into(),
-        "monokai".into(),
-        "one-dark".into(),
-        "synthwave-84".into(),
-        "everforest-dark".into(),
-    ];
+    let mut presets: Vec<String> = BUNDLED_THEMES
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
 
     // Scan user themes directory for additional .toml files
     let dir = themes_dir();
@@ -1758,6 +1726,36 @@ page_size = 250
     }
 
     #[test]
+    fn test_config_load_override() {
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let conf_dir = temp_dir.path().join("glab-tui");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        std::fs::write(
+            conf_dir.join("config.toml"),
+            "page_size = 250\napi_per_page = 20\n",
+        )
+        .unwrap();
+
+        let old_xdg = std::env::var("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        }
+        let cfg = Config::load();
+        if let Ok(old) = old_xdg {
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", old);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+        }
+        assert_eq!(cfg.page_size, 250);
+        assert_eq!(cfg.api_per_page, 20);
+    }
+
+    #[test]
     fn revoke_mr_defaults_to_shift_a() {
         let cfg = Config::default();
         assert_eq!(cfg.keybindings.mrs.revoke_mr, "A");
@@ -1767,6 +1765,17 @@ page_size = 250
     fn rebase_mr_defaults_to_shift_r() {
         let cfg = Config::default();
         assert_eq!(cfg.keybindings.mrs.rebase_mr, "R");
+    }
+
+    #[test]
+    fn fetch_label_colors_defaults_true_and_is_configurable() {
+        assert!(Config::default().fetch_label_colors);
+
+        let disabled: Config = toml::from_str("fetch_label_colors = false").expect("parse config");
+        assert!(!disabled.fetch_label_colors);
+
+        let empty: Config = toml::from_str("").expect("parse empty config");
+        assert!(empty.fetch_label_colors);
     }
 
     #[test]
@@ -1795,6 +1804,27 @@ page_size = 250
                     "duplicate MR keybinding {binding:?}: used by both `{other_field}` and `{field}`"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_all_bundled_themes_parse_successfully() {
+        for (name, _) in BUNDLED_THEMES {
+            assert!(
+                Theme::preset(name).is_some(),
+                "Bundled theme '{name}' failed to parse into valid Theme"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_theme_presets_includes_all_bundled() {
+        let presets = all_theme_presets();
+        for (name, _) in BUNDLED_THEMES {
+            assert!(
+                presets.contains(&name.to_string()),
+                "all_theme_presets() missing bundled theme '{name}'"
+            );
         }
     }
 }

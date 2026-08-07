@@ -6,11 +6,19 @@ set -euo pipefail
 # Usage: scripts/release.sh [patch|minor|major]
 #
 # With no argument, you are prompted to pick the release increment (patch is
-# the default). Walks the whole release: bumps the crate version, regenerates
-# docs and demo GIFs locally (where `gh` is authenticated), opens a prepare PR,
-# waits for you to review it, squash-merges it, tags and pushes the version,
-# waits for the CI release build, then writes the release notes and pushes the
-# Homebrew formula, Scoop manifest, Docker image, and crate.
+# the default). You are also prompted to pick the opencode model used for the
+# regenerated docs and release notes (the `opencode models` printout piped
+# through fzf; set OPENCODE_MODEL to skip the prompt). Walks the whole
+# release: bumps the crate version, regenerates docs and demo GIFs locally
+# (where `gh` is authenticated), opens a prepare PR, waits for you to review
+# it, squash-merges it, tags and pushes the version, waits for the CI release
+# build, then writes the release notes and pushes the Homebrew formula, Scoop
+# manifest, Docker image, and crate.
+#
+# You may resume from any phase by answering the "start from" prompt that
+# appears after the banner. Phases that require state set by earlier phases
+# (version tag, PR number, ...) will prompt for those values if they were
+# skipped.
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
@@ -18,6 +26,7 @@ cd "$ROOT"
 REPO="rcieri/glab-tui"
 INCREMENT="${1:-}"
 RELEASE_WAIT_MIN="${RELEASE_WAIT_MIN:-45}"
+OPENCODE_MODEL_FROM_ENV="${OPENCODE_MODEL:-}"
 OPENCODE_MODEL="${OPENCODE_MODEL:-opencode/big-pickle}"
 REQUIRED_ASSETS=(
   glab-tui-linux-amd64.tar.gz
@@ -37,23 +46,225 @@ else
   C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_RESET=''
 fi
 
-die() { printf '%serror:%s %s\n' "${C_BOLD}${C_RED}" "$C_RESET" "$*" >&2; exit 1; }
+die()     { printf '%serror:%s %s\n' "${C_BOLD}${C_RED}" "$C_RESET" "$*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null 2>&1 || die "missing required tool '$1' (${2:-})"; }
-note() { printf '\n%s==>%s %s\n' "${C_BOLD}${C_CYAN}" "$C_RESET" "$*"; }
-ok() { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
-phase() { printf '\n%s── [ %s ] ──%s\n' "${C_BOLD}${C_YELLOW}" "$*" "$C_RESET"; }
-banner() {
+note()    { printf '\n%s==>%s %s\n' "${C_BOLD}${C_CYAN}" "$C_RESET" "$*"; }
+ok()      { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+PHASE_COUNT=7
+phase()   { printf '\n%s── [ %s/%s · %s ] ──%s\n' "${C_BOLD}${C_YELLOW}" "$1" "$PHASE_COUNT" "${*:2}" "$C_RESET"; }
+banner()  {
   printf '\n%s============================================%s\n' "${C_BOLD}${C_CYAN}" "$C_RESET"
   printf '%s  glab-tui release orchestrator%s\n' "${C_BOLD}" "$C_RESET"
   printf '%s============================================%s\n' "${C_BOLD}${C_CYAN}" "$C_RESET"
 }
 
-run_opencode() {
-  note "opencode ($OPENCODE_MODEL), output logged to $TMP_DIR/opencode.log"
-  if ! opencode run --auto --model "$OPENCODE_MODEL" "$1" >"$TMP_DIR/opencode.log" 2>&1; then
-    tail -20 "$TMP_DIR/opencode.log" >&2
-    die "opencode failed (log: $TMP_DIR/opencode.log)"
+# ---------------------------------------------------------------------------
+# spinner / progress bar helpers (auto-disabled when not a TTY)
+# ---------------------------------------------------------------------------
+SPINNER_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+# spinner <label> <command...>
+# Runs <command> with its output captured to $TMP_DIR/spinner.log while an
+# animated spinner ticks in place on the current line. On failure the tail of
+# the log is printed so you can see what went wrong. Returns the command's
+# exit status so the caller's `set -e` / `if` semantics are preserved.
+spinner() {
+  local label="$1"
+  shift
+  if [[ ! -t 1 ]]; then
+    "$@"
+    return $?
   fi
+
+  local log="${TMP_DIR}/spinner.log"
+  : > "$log"
+
+  # The animator runs in the background; the command stays in the foreground
+  # so Ctrl-C and exit codes behave exactly as if it had been run directly.
+  (
+    local i=0 start=$SECONDS
+    printf '\e[?25l'
+    while true; do
+      printf '\r\e[2K%s%s %s%s %s%ss%s' \
+        "$C_YELLOW" "${SPINNER_FRAMES[i % ${#SPINNER_FRAMES[@]}]}" \
+        "$C_BOLD" "$label" "$C_DIM" "$((SECONDS - start))" "$C_RESET"
+      i=$((i + 1))
+      sleep 0.1
+    done
+  ) &
+  local animator=$!
+  local status=0
+  "$@" >"$log" 2>&1 || status=$?
+  kill "$animator" 2>/dev/null || true
+  wait "$animator" 2>/dev/null || true
+  printf '\r\e[2K\e[?25h'
+  if (( status != 0 )); then
+    printf '%serror:%s %s\n' "${C_BOLD}${C_RED}" "$C_RESET" "$label" >&2
+    tail -20 "$log" >&2
+  fi
+  return "$status"
+}
+
+# progress_bar <current> <total> <label...>
+# Renders an in-place determinate progress bar, e.g. "[██████░░░░]  30% assets".
+progress_bar() {
+  local current="$1" total="$2"
+  shift 2
+  local width=20 pct=0 filled=0 empty=0 i bar=""
+  if (( total > 0 )); then
+    pct=$((current * 100 / total))
+  fi
+  filled=$((pct * width / 100))
+  empty=$((width - filled))
+  for ((i = 0; i < filled; i++)); do bar+="█"; done
+  for ((i = 0; i < empty; i++)); do bar+="░"; done
+  printf '\r\e[2K  %s[%s]%s %3d%%  %s%s%s' \
+    "$C_YELLOW" "$bar" "$C_RESET" "$pct" "$C_DIM" "$*" "$C_RESET"
+}
+
+run_opencode() {
+  note "opencode ($OPENCODE_MODEL), output logged to $TMP_DIR/spinner.log"
+  if ! spinner "opencode ($OPENCODE_MODEL)" \
+      opencode run --auto --model "$OPENCODE_MODEL" "$1"; then
+    die "opencode failed (log: $TMP_DIR/spinner.log)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# opencode model selection (fzf over the `opencode models` printout)
+# ---------------------------------------------------------------------------
+PICK_RESULT=''
+
+# pick <prompt> <default> <candidate...>; each candidate is "value<TAB>label".
+# Stores the chosen value in PICK_RESULT (defaults when nothing is picked).
+pick() {
+  local prompt="$1" default="$2"
+  shift 2
+  local -a lines=("$@")
+  local chosen="" i choice
+  if command -v fzf >/dev/null 2>&1; then
+    chosen="$(printf '%s\n' "${lines[@]}" |
+      fzf --prompt="$prompt> " --query="$default" --delimiter=$'\t' --with-nth=2 \
+          --exit-0 --height=40% --border --layout=reverse 2>/dev/null || true)"
+  else
+    printf '\n%sChoose %s%s (default: %s)\n' "$C_BOLD" "$prompt" "$C_RESET" "$default"
+    for i in "${!lines[@]}"; do
+      printf '  %s%s)%s %s\n' "$C_BOLD" "$((i + 1))" "$C_RESET" "${lines[$i]#*$'\t'}"
+    done
+    read -r -p "Select [1-${#lines[@]}], Enter for default: " choice
+    if [[ -z "$choice" ]]; then
+      chosen="$default"
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#lines[@]})); then
+      chosen="${lines[$((choice - 1))]}"
+    else
+      die "invalid selection '$choice'"
+    fi
+  fi
+  PICK_RESULT="${chosen%%$'\t'*}"
+  if [[ -z "$PICK_RESULT" ]]; then
+    PICK_RESULT="$default"
+  fi
+}
+
+select_opencode_model() {
+  local all_models selected current
+  local -a model_lines=()
+
+  all_models="$(opencode models)"
+  [[ -n "$all_models" ]] || die "'opencode models' returned no models"
+  current="${OPENCODE_MODEL:-opencode/big-pickle}"
+
+  note "Select the opencode model used to regenerate docs and release notes"
+  while read -r id; do
+    model_lines+=("$id"$'\t'"$id")
+  done <<< "$all_models"
+  pick "model" "$current" "${model_lines[@]}"
+  selected="$PICK_RESULT"
+
+  OPENCODE_MODEL="$selected"
+  grep -qxF "$OPENCODE_MODEL" <<< "$all_models" || \
+    die "'$OPENCODE_MODEL' is not listed by 'opencode models'"
+  ok "opencode model: $OPENCODE_MODEL"
+}
+
+# ---------------------------------------------------------------------------
+# Starting-point picker
+# ---------------------------------------------------------------------------
+# Phase IDs (numeric so we can do >= comparisons)
+PHASE_PREFLIGHT=0
+PHASE_PREPARE=1
+PHASE_GIFS=2
+PHASE_REVIEW=3
+PHASE_WAIT_CI=4
+PHASE_POST_RELEASE=5
+PHASE_PUBLISH=6
+
+START_PHASE=$PHASE_PREFLIGHT   # default: run everything
+
+select_start_phase() {
+  local -a phase_lines=(
+    "$PHASE_PREFLIGHT"$'\t'"0 · From the beginning  (preflight → prepare → GIFs → review → CI → post-release → publish)"
+    "$PHASE_PREPARE"$'\t'"1 · Prepare docs & PR    (version bump, opencode docs, create PR — skips preflight)"
+    "$PHASE_GIFS"$'\t'"2 · Generate GIFs only   (re-run generate-demos.sh, push, rebuild PR if needed)"
+    "$PHASE_REVIEW"$'\t'"3 · Review & merge       (squash-merge an existing PR and tag)"
+    "$PHASE_WAIT_CI"$'\t'"4 · Wait for CI build    (poll release assets for an already-tagged version)"
+    "$PHASE_POST_RELEASE"$'\t'"5 · Post-release         (release notes, Homebrew formula, Scoop manifest)"
+    "$PHASE_PUBLISH"$'\t'"6 · Publish              (Docker image → GHCR + crate → crates.io)"
+  )
+
+  note "Where would you like to start?"
+  pick "start phase" "$PHASE_PREFLIGHT" "${phase_lines[@]}"
+  START_PHASE="$PICK_RESULT"
+  ok "Starting from phase $START_PHASE"
+}
+
+# ---------------------------------------------------------------------------
+# State bootstrap helpers — prompt for values that skipped phases would set
+# ---------------------------------------------------------------------------
+
+# Ensure NEW_TAG / VERSION are set; fetch from git tags or prompt.
+ensure_version() {
+  if [[ -n "${NEW_TAG:-}" ]]; then return; fi
+
+  git fetch --tags --prune 2>/dev/null || true
+  local latest_tag
+  latest_tag="$(git describe --tags --abbrev=0 2>/dev/null || echo "")"
+
+  printf '\n%sEnter the release tag%s (e.g. v1.2.3)' "$C_BOLD" "$C_RESET"
+  if [[ -n "$latest_tag" ]]; then
+    printf ' [latest tag: %s]' "$latest_tag"
+  fi
+  printf ': '
+  read -r NEW_TAG
+  [[ -n "$NEW_TAG" ]] || die "version tag is required"
+  [[ "$NEW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || die "tag must match vX.Y.Z (got '$NEW_TAG')"
+  VERSION="${NEW_TAG#v}"
+  ok "Version: $NEW_TAG"
+}
+
+# Ensure BRANCH is set (derived from NEW_TAG when not set by prepare()).
+ensure_branch() {
+  if [[ -n "${BRANCH:-}" ]]; then return; fi
+  ensure_version
+  BRANCH="opencode-release/$NEW_TAG"
+}
+
+# Ensure PR_NUMBER is set; look it up or prompt.
+ensure_pr_number() {
+  if [[ -n "${PR_NUMBER:-}" ]]; then return; fi
+  ensure_branch
+
+  PR_NUMBER="$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || true)"
+  if [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "null" ]]; then
+    PR_NUMBER="$(gh pr list --repo "$REPO" --head "$BRANCH" --state merged --json number --jq '.[0].number' 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "null" ]]; then
+    printf '\n%sEnter the PR number%s for branch %s: ' "$C_BOLD" "$C_RESET" "$BRANCH"
+    read -r PR_NUMBER
+    [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be a positive integer"
+  fi
+  ok "PR #$PR_NUMBER"
 }
 
 # ---------------------------------------------------------------------------
@@ -69,13 +280,18 @@ preflight() {
   require ttyd "apt install ttyd / brew install ttyd"
   require ffmpeg "apt install ffmpeg / brew install ffmpeg"
   require unzip "apt install unzip"
-  gh auth status >/dev/null 2>&1 || die "not authenticated with gh; run 'gh auth login' first"
-  for repo in rcieri/homebrew-glab-tui rcieri/scoop-glab-tui; do
-    gh api "repos/$repo" --jq '.permissions.push' | grep -q true || \
-      die "no push access to $repo; grant your token write permission"
-  done
-  fc-list 2>/dev/null | grep -qi "JetBrainsMono.*Nerd" || \
-    die "JetBrainsMono Nerd Font not installed (download from https://github.com/ryanoasis/nerd-fonts)"
+  if ! spinner "Checking gh auth, push access, and fonts" bash -c '
+    gh auth status >/dev/null 2>&1 || { echo "not authenticated with gh; run gh auth login first"; exit 1; }
+    for repo in rcieri/homebrew-glab-tui rcieri/scoop-glab-tui; do
+      gh api "repos/$repo" --jq ".permissions.push" | grep -q true || \
+        { echo "no push access to $repo; grant your token write permission"; exit 1; }
+    done
+    fc-list 2>/dev/null | grep -qi "JetBrainsMono.*Nerd" || \
+      { echo "JetBrainsMono Nerd Font not installed (see https://github.com/ryanoasis/nerd-fonts)"; exit 1; }
+    exit 0
+  '; then
+    die "preflight checks failed (see $TMP_DIR/spinner.log)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -115,6 +331,7 @@ next_version() {
   fi
 
   NEW_TAG="v$VERSION"
+  BRANCH="opencode-release/$NEW_TAG"
   note "Next version: $NEW_TAG"
 }
 
@@ -130,7 +347,8 @@ bump_cargo_version() {
 }
 
 prepare() {
-  BRANCH="opencode-release/$NEW_TAG"
+  ensure_version   # no-op if next_version() already ran
+
   if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
     git checkout "$BRANCH"
   elif git ls-remote --exit-code --quiet origin "refs/heads/$BRANCH" 2>/dev/null; then
@@ -140,8 +358,7 @@ prepare() {
   fi
 
   bump_cargo_version
-  note "Building release binary..."
-  cargo build --release
+  spinner "Building release binary" cargo build --release
 
   note "Regenerating CHANGELOG.md / AGENTS.md / README.md via opencode..."
   PROMPT="We are prepping a new repository release. The upcoming version tag is going to be: $NEW_TAG.
@@ -156,17 +373,29 @@ The crate version in Cargo.toml and Cargo.lock has already been bumped to $VERSI
 
   run_opencode "$PROMPT"
   ok "CHANGELOG.md / AGENTS.md / README.md regenerated"
+}
 
-  note "Generating demo GIFs..."
+# ---------------------------------------------------------------------------
+# Phase 2: generate demo GIFs
+# ---------------------------------------------------------------------------
+generate_gifs() {
+  ensure_branch
+
+  # Make sure there is a built binary on PATH.
+  if [[ ! -x "$ROOT/target/release/glab-tui" ]]; then
+    spinner "Building release binary" cargo build --release
+  fi
+
   export PATH="$ROOT/target/release:$PATH"
-  "$ROOT/assets/generate-demos.sh"
+  spinner "Generating demo GIFs" "$ROOT/assets/generate-demos.sh"
   ok "demo GIFs regenerated"
 
+  # Stage and commit the GIFs (and any other outstanding prepare changes).
   git add CHANGELOG.md AGENTS.md README.md Cargo.toml Cargo.lock assets/demo-*.gif
   if ! git diff --cached --quiet; then
     git commit -m "chore: prepare release $NEW_TAG"
   fi
-  git push -u origin "$BRANCH"
+  spinner "Pushing branch $BRANCH" git push -u origin "$BRANCH"
 
   PR_NUMBER="$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || true)"
   if [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "null" ]]; then
@@ -187,28 +416,36 @@ Review, then this script will merge and cut the release.")"
 }
 
 # ---------------------------------------------------------------------------
-# Phase 2: wait for review, then merge and tag
+# Phase 3: wait for review, then merge and tag
 # ---------------------------------------------------------------------------
 review_gate() {
-  note "Pause for review"
+  ensure_pr_number
+  PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
+  note "Pause for review — PR: $PR_URL"
   read -r -p "Review the PR (CI checks run in the background). Press Enter to squash-merge and continue the release... "
 }
 
 merge_and_tag() {
+  ensure_version
+  ensure_pr_number
+
   note "Merging PR #$PR_NUMBER (squash, auto-merge when checks pass)..."
-  if ! gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --auto 2>/dev/null; then
+  if ! spinner "Merging PR #$PR_NUMBER" gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --auto; then
     local state
     state="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq '.state')"
     [[ "$state" == "MERGED" ]] || die "failed to merge PR #$PR_NUMBER (conflicts? not mergeable?)"
   fi
-  for i in $(seq 1 120); do
-    if [[ "$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq '.state')" == "MERGED" ]]; then
-      ok "PR #$PR_NUMBER merged"
-      break
-    fi
-    [[ $i -eq 120 ]] && die "timed out waiting for PR #$PR_NUMBER to merge"
-    sleep 10
-  done
+  export PR_NUMBER REPO
+  if ! spinner "Waiting for PR #$PR_NUMBER to merge (up to 20m)" bash -c '
+      for i in $(seq 1 120); do
+        [[ "$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq .state)" == "MERGED" ]] && exit 0
+        sleep 10
+      done
+      exit 1
+    '; then
+    die "timed out waiting for PR #$PR_NUMBER to merge"
+  fi
+  ok "PR #$PR_NUMBER merged"
 
   note "Tagging $NEW_TAG on the merge commit..."
   local merge_sha
@@ -220,40 +457,42 @@ merge_and_tag() {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 3: wait for the CI release build
+# Phase 4: wait for the CI release build
 # ---------------------------------------------------------------------------
 wait_for_release() {
+  ensure_version
+
   local total i current elapsed
   total=$((RELEASE_WAIT_MIN * 3)) # one check every 20s
   note "Waiting for release $NEW_TAG assets (timeout ${RELEASE_WAIT_MIN}m)..."
   for i in $(seq 1 "$total"); do
     current="$(gh release view "$NEW_TAG" --repo "$REPO" --json assets --jq '[.assets[].name] | length' 2>/dev/null || echo 0)"
     if [[ "$current" -ge "${#REQUIRED_ASSETS[@]}" ]]; then
-      [[ -t 1 ]] && printf '\r\033[2K'
+      [[ -t 1 ]] && printf '\r\e[2K'
       ok "All ${#REQUIRED_ASSETS[@]} release assets present"
       return 0
     fi
     [[ $i -eq $total ]] && die "timed out waiting for release assets for $NEW_TAG"
     if [[ -t 1 ]]; then
       elapsed=$((i * 20 / 60))
-      printf '\r  %smin elapsed - %s/%s assets...' "$elapsed" "$current" "${#REQUIRED_ASSETS[@]}"
+      progress_bar "$current" "${#REQUIRED_ASSETS[@]}" "assets ($elapsed min elapsed)"
     fi
     sleep 20
   done
 }
 
 # ---------------------------------------------------------------------------
-# Phase 4: post-release (notes, Homebrew, Scoop)
+# Phase 5: post-release (notes, Homebrew, Scoop)
 # ---------------------------------------------------------------------------
 update_homebrew() {
   local arch file sha macos_amd64 macos_arm64 linux_amd64 linux_arm64
-  gh repo clone rcieri/homebrew-glab-tui "$TMP_DIR/homebrew-glab-tui" >/dev/null
+  spinner "Cloning rcieri/homebrew-glab-tui" gh repo clone rcieri/homebrew-glab-tui "$TMP_DIR/homebrew-glab-tui"
   cd "$TMP_DIR/homebrew-glab-tui"
 
   for arch in macos-amd64 macos-arm64 linux-amd64 linux-arm64; do
     file="$TMP_DIR/glab-tui-${arch}.tar.gz"
-    note "Fetching glab-tui-${arch}.tar.gz..."
-    curl -sL "https://github.com/$REPO/releases/download/$NEW_TAG/glab-tui-${arch}.tar.gz" -o "$file"
+    spinner "Fetching glab-tui-${arch}.tar.gz" \
+      curl -sL "https://github.com/$REPO/releases/download/$NEW_TAG/glab-tui-${arch}.tar.gz" -o "$file"
     sha="$(sha256sum "$file" | cut -d' ' -f1)"
     case "$arch" in
       macos-amd64) macos_amd64=$sha ;;
@@ -276,7 +515,7 @@ update_homebrew() {
     git -c user.name="opencode-release[bot]" \
         -c user.email="opencode-release[bot]@users.noreply.github.com" \
         commit -m "Update to ${NEW_TAG}" >/dev/null
-    git push
+    spinner "Pushing Homebrew formula" git push
     ok "Homebrew formula updated and pushed"
   fi
   cd "$ROOT"
@@ -284,12 +523,12 @@ update_homebrew() {
 
 update_scoop() {
   local version sha
-  gh repo clone rcieri/scoop-glab-tui "$TMP_DIR/scoop-glab-tui" >/dev/null
+  spinner "Cloning rcieri/scoop-glab-tui" gh repo clone rcieri/scoop-glab-tui "$TMP_DIR/scoop-glab-tui"
   cd "$TMP_DIR/scoop-glab-tui"
 
   version="${NEW_TAG#v}"
-  note "Fetching glab-tui-windows-amd64.zip..."
-  curl -sL "https://github.com/$REPO/releases/download/$NEW_TAG/glab-tui-windows-amd64.zip" -o "$TMP_DIR/glab-tui-windows-amd64.zip"
+  spinner "Fetching glab-tui-windows-amd64.zip" \
+    curl -sL "https://github.com/$REPO/releases/download/$NEW_TAG/glab-tui-windows-amd64.zip" -o "$TMP_DIR/glab-tui-windows-amd64.zip"
   sha="$(sha256sum "$TMP_DIR/glab-tui-windows-amd64.zip" | cut -d' ' -f1)"
 
   jq --arg v "$version" --arg sha "$sha" \
@@ -304,15 +543,17 @@ update_scoop() {
     git -c user.name="opencode-release[bot]" \
         -c user.email="opencode-release[bot]@users.noreply.github.com" \
         commit -m "Update to ${NEW_TAG}" >/dev/null
-    git push
+    spinner "Pushing Scoop manifest" git push
     ok "Scoop manifest updated and pushed"
   fi
   cd "$ROOT"
 }
 
 post_release() {
+  ensure_version
+
   local prev_tag prompt
-  prev_tag="$(git describe --tags --abbrev=0 "$NEW_TAG^" 2>/dev/null || git describe --tags --abbrev=0 2>/dev/null || true)"
+  prev_tag="$(git describe --tags --abbrev=0 "${NEW_TAG}^" 2>/dev/null || git describe --tags --abbrev=0 2>/dev/null || true)"
   [[ -n "$prev_tag" ]] || die "could not determine the previous tag before $NEW_TAG"
 
   note "Generating RELEASE_NOTES.md via opencode..."
@@ -335,16 +576,18 @@ Use the content from CHANGELOG.md for the current version as the source material
   ok "RELEASE_NOTES.md generated"
 
   note "Updating release $NEW_TAG body..."
-  gh release edit "$NEW_TAG" --repo "$REPO" --notes-file RELEASE_NOTES.md
+  spinner "Updating release $NEW_TAG body" gh release edit "$NEW_TAG" --repo "$REPO" --notes-file RELEASE_NOTES.md
 
   update_homebrew
   update_scoop
 }
 
 # ---------------------------------------------------------------------------
-# Phase 5: publish (Docker image + crate)
+# Phase 6: publish (Docker image + crate)
 # ---------------------------------------------------------------------------
 publish() {
+  ensure_version
+
   local package_version tag_version user
   package_version="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r '.packages[0].version')"
   tag_version="${NEW_TAG#v}"
@@ -352,19 +595,17 @@ publish() {
     die "Cargo package version ($package_version) does not match tag version ($tag_version)"
   fi
 
-  note "Pushing Docker image to GHCR..."
   require docker "see https://docs.docker.com/get-docker/"
   user="$(gh api user --jq .login)"
-  gh auth token | docker login ghcr.io -u "$user" --password-stdin
+  spinner "Authenticating to GHCR" bash -c 'gh auth token | docker login ghcr.io -u "$0" --password-stdin' "$user"
   local tags_args=(-t "ghcr.io/$REPO:$NEW_TAG")
   if [[ "$NEW_TAG" != *-* ]]; then
     tags_args+=(-t "ghcr.io/$REPO:latest")
   fi
-  docker buildx build --push "${tags_args[@]}" .
+  spinner "Building & pushing Docker image to GHCR" docker buildx build --push "${tags_args[@]}" .
   ok "Docker image pushed to GHCR"
 
-  note "Publishing crate v$package_version to crates.io..."
-  cargo publish --locked
+  spinner "Publishing crate v$package_version to crates.io" cargo publish --locked
   ok "crate v$package_version published to crates.io"
 }
 
@@ -373,32 +614,87 @@ publish() {
 # ---------------------------------------------------------------------------
 main() {
   TMP_DIR="$(mktemp -d)"
-  trap 'rm -rf "$TMP_DIR"' EXIT
+  trap 'printf "\e[?25h" 2>/dev/null || true; rm -rf "$TMP_DIR"' EXIT
   banner
 
-  phase "Preflight"
-  preflight
+  # ── Starting-point picker ──────────────────────────────────────────────────
+  select_start_phase
 
-  phase "Prepare"
-  next_version
-  prepare
+  # ── Phase 0: Preflight ────────────────────────────────────────────────────
+  if [[ "$START_PHASE" -le "$PHASE_PREFLIGHT" ]]; then
+    phase 1 "Preflight"
+    preflight
+  fi
 
-  phase "Review & merge"
-  review_gate
-  merge_and_tag
+  # ── Phase 1: Prepare (version bump, docs, PR) ─────────────────────────────
+  if [[ "$START_PHASE" -le "$PHASE_PREPARE" ]]; then
+    phase 2 "Prepare"
+    next_version
+    if [[ -z "$OPENCODE_MODEL_FROM_ENV" ]]; then
+      select_opencode_model
+    else
+      ok "using OPENCODE_MODEL from environment: $OPENCODE_MODEL"
+    fi
+    prepare
+  fi
 
-  phase "Wait for CI build"
-  wait_for_release
+  # ── Phase 2: Generate GIFs ────────────────────────────────────────────────
+  if [[ "$START_PHASE" -le "$PHASE_GIFS" ]]; then
+    phase 3 "Generate GIFs"
+    # If jumping directly to this phase, hydrate required state.
+    if [[ "$START_PHASE" -ge "$PHASE_GIFS" ]]; then
+      ensure_version
+      if [[ -z "$OPENCODE_MODEL_FROM_ENV" ]]; then
+        select_opencode_model
+      else
+        ok "using OPENCODE_MODEL from environment: $OPENCODE_MODEL"
+      fi
+    fi
+    generate_gifs
+  fi
 
-  phase "Post-release"
-  post_release
+  # ── Phase 3: Review & merge ───────────────────────────────────────────────
+  if [[ "$START_PHASE" -le "$PHASE_REVIEW" ]]; then
+    phase 4 "Review & merge"
+    review_gate
+    merge_and_tag
+  fi
 
-  phase "Publish"
-  publish
+  # ── Phase 4: Wait for CI build ────────────────────────────────────────────
+  if [[ "$START_PHASE" -le "$PHASE_WAIT_CI" ]]; then
+    phase 5 "Wait for CI build"
+    if [[ "$START_PHASE" -ge "$PHASE_WAIT_CI" ]]; then
+      ensure_version
+    fi
+    wait_for_release
+  fi
+
+  # ── Phase 5: Post-release (notes, Homebrew, Scoop) ───────────────────────
+  if [[ "$START_PHASE" -le "$PHASE_POST_RELEASE" ]]; then
+    phase 6 "Post-release"
+    if [[ "$START_PHASE" -ge "$PHASE_POST_RELEASE" ]]; then
+      ensure_version
+      if [[ -z "$OPENCODE_MODEL_FROM_ENV" ]]; then
+        select_opencode_model
+      else
+        ok "using OPENCODE_MODEL from environment: $OPENCODE_MODEL"
+      fi
+    fi
+    post_release
+  fi
+
+  # ── Phase 6: Publish (Docker + crate) ────────────────────────────────────
+  if [[ "$START_PHASE" -le "$PHASE_PUBLISH" ]]; then
+    phase 7 "Publish"
+    if [[ "$START_PHASE" -ge "$PHASE_PUBLISH" ]]; then
+      ensure_version
+    fi
+    publish
+  fi
 
   git checkout main 2>/dev/null || true
-  git branch -D "$BRANCH" 2>/dev/null || true
-  ok "Release $NEW_TAG complete."
+  git branch -D "${BRANCH:-}" 2>/dev/null || true
+  ok "Release ${NEW_TAG:-} complete."
 }
 
 main "$@"

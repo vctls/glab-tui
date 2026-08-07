@@ -67,8 +67,13 @@ impl GitlabClient {
         self.backend.start_job(project_path, job_id).await
     }
 
-    pub async fn fetch_labels(&self, project_path: &str) -> Result<Vec<String>> {
-        self.backend.fetch_labels(project_path).await
+    pub async fn fetch_labels(
+        &self,
+        project_path: &str,
+    ) -> Result<Vec<crate::domain::labels::Label>> {
+        self.backend
+            .fetch_labels(project_path, self.api_per_page)
+            .await
     }
 
     pub async fn fetch_members(&self, project_path: &str) -> Result<Vec<String>> {
@@ -498,12 +503,18 @@ impl GitlabClient {
         iids: &[u64],
         milestone: &str,
     ) -> Result<()> {
-        if milestone.trim().is_empty() {
+        let trimmed = milestone.trim();
+        if trimmed.is_empty() {
             return Ok(());
         }
+        let target = if trimmed.eq_ignore_ascii_case("none") || trimmed == "0" {
+            "None"
+        } else {
+            trimmed
+        };
         for &iid in iids {
             self.backend
-                .update_issue_milestone(project, iid, milestone)
+                .update_issue_milestone(project, iid, target)
                 .await?;
         }
         Ok(())
@@ -559,12 +570,18 @@ impl GitlabClient {
         iids: &[u64],
         milestone: &str,
     ) -> Result<()> {
-        if milestone.trim().is_empty() {
+        let trimmed = milestone.trim();
+        if trimmed.is_empty() {
             return Ok(());
         }
+        let target = if trimmed.eq_ignore_ascii_case("none") || trimmed == "0" {
+            "None"
+        } else {
+            trimmed
+        };
         for &iid in iids {
             self.backend
-                .update_mr_milestone(project, iid, milestone)
+                .update_mr_milestone(project, iid, target)
                 .await?;
         }
         Ok(())

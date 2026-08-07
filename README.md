@@ -4,7 +4,49 @@
 <img src="assets/glab-tui-banner-v2.svg" alt="glab-tui" width="560">
 </p>
 
+<p align="center">
+<a href="https://github.com/rcieri/glab-tui/actions/workflows/rust.yml"><img src="https://github.com/rcieri/glab-tui/actions/workflows/rust.yml/badge.svg" alt="CI Status"></a>
+<a href="https://crates.io/crates/glab-tui-crate"><img src="https://img.shields.io/crates/v/glab-tui-crate.svg" alt="Crates.io"></a>
+<a href="https://github.com/rcieri/glab-tui/releases/latest"><img src="https://img.shields.io/github/v/release/rcieri/glab-tui.svg" alt="GitHub Release"></a>
+<a href="https://github.com/rcieri/homebrew-glab-tui"><img src="https://img.shields.io/github/v/release/rcieri/glab-tui?label=homebrew" alt="Homebrew"></a>
+<a href="https://github.com/rcieri/scoop-glab-tui"><img src="https://img.shields.io/github/v/release/rcieri/glab-tui?label=scoop" alt="Scoop"></a>
+<a href="https://github.com/rcieri/glab-tui/pkgs/container/glab-tui"><img src="https://img.shields.io/badge/docker-ghcr.io%2Frcieri%2Fglab--tui-blue" alt="Docker"></a>
+<a href="LICENSE.md"><img src="https://img.shields.io/github/license/rcieri/glab-tui.svg" alt="License"></a>
+</p>
+
 A terminal user interface (TUI) for GitLab and GitHub, built on top of [`glab`](https://gitlab.com/gitlab-org/cli) and [`gh`](https://cli.github.com/). Browse issues, pull requests / merge requests, pipelines, runners, and releases without leaving your terminal.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+  - [Package Manager](#package-manager)
+  - [From source](#from-source)
+  - [With cargo install (from crates.io)](#with-cargo-install-from-cratesio)
+  - [Install script (Linux / macOS)](#install-script-linux--macos)
+  - [Install script (Windows)](#install-script-windows)
+  - [Docker](#docker)
+  - [Homebrew](#homebrew)
+  - [Scoop (Windows)](#scoop-windows)
+- [Configuration](#configuration)
+  - [Authentication](#authentication)
+  - [Config file](#config-file)
+  - [Custom themes](#custom-themes)
+  - [Editor](#editor)
+- [Usage](#usage)
+  - [Options](#options)
+  - [CLI subcommand examples](#cli-subcommand-examples)
+- [Filtering, Grouping & Columns](#filtering-grouping--columns)
+- [Key Bindings](#key-bindings)
+- [Dependencies](#dependencies)
+- [Project Structure](#project-structure)
+- [Running Tests](#running-tests)
+- [Releasing](#releasing)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 
@@ -15,6 +57,7 @@ A terminal user interface (TUI) for GitLab and GitHub, built on top of [`glab`](
 - **Bulk editing** — select multiple issues or merge requests with `Space`, then press `e` to apply labels, assignees, or milestone across all selected items at once
 - **Issues** — list, filter, create, and edit issues (title, labels, assignees, milestone, due date, weight, confidentiality, description)
 - **Merge Requests / Pull Requests** — list, filter, create MRs from issues, approve, merge, view diffs in terminal with code reviews, and edit MR/PR metadata
+- **MR/PR review state at a glance** — color-coded **Approval** (`APPROVED`, `AWAITING`, `REVIEW REQ`, …), **Mergeable** (`CONFLICT`, `REBASE`, `CLEAN`), and **Workflow** (Returned / Review req / Yours / Approved / By others / Inactive) columns; rebase with `R`, revoke your approval with `A` (GitLab)
 - **Code Reviews** — draft inline comments, multi-line selections, code suggestions with syntax highlighting, and atomic review submission
 - **Side-by-Side Diff** — toggle between unified and side-by-side diff layouts with syntax highlighting
 - **Pipelines / Actions** — inspect pipelines and their jobs, retry/cancel pipelines/actions and individual jobs, stream build traces; trigger pipelines with `workflow_dispatch` input prompts
@@ -25,7 +68,7 @@ A terminal user interface (TUI) for GitLab and GitHub, built on top of [`glab`](
 - **Branches** — browse branches with default/protected markers; create and delete branches inline
 - **Environments & Deployments** — browse environments and their deployment status, drilling into deployment history with `Enter`
 - **Terminal** — live log of every `glab`/`gh` command the TUI executes, with success/failure status
-- **Multi-colored Labels** — table columns render labels with their individual unique hashed colors, preserving search highlights
+- **Real label colors** — the Labels column renders each label with its actual color from the API (`glab label list` / `gh label list`), falling back to the theme palette for light GitHub-style background-fill colors; toggle with `fetch_label_colors` in `config.toml`
 - **Columns Config Modal** — press `Tab` / `,` to open a centered popup overlay to toggle column visibility (`Space`), group by any column, set sort order, page size, and theme
 - **Value-based Column Filtering** — press `Enter` on any column inside the configure popup to filter rows by that column's values (e.g. Issues → `State` → `opened`); multi-select supports multiple values per column
 - **Live Search** — fuzzy-filter across all visible columns by pressing `/`
@@ -37,7 +80,7 @@ A terminal user interface (TUI) for GitLab and GitHub, built on top of [`glab`](
 - **Self-update** — press `u` in the TUI (or run `glab-tui --update`) to check for and install updates
 - **CLI subcommands** — `doctor` (system diagnostics), `clean-cache` (stale cache cleanup), `cache` (list cached data), `open` (open entity in browser), `repos` (list recent repositories)
 - **Lazy-load tabs** — data for each tab is only fetched the first time you switch to it; refresh with `F5` / `Ctrl+R`
-- **Themes** — 13 built-in color themes; fully customizable via `config.toml` or custom `.toml` files
+- **Themes** — 16 built-in color themes; fully customizable via `config.toml` or custom `.toml` files
 - **Configurable keybindings** — every action is remappable in `~/.config/glab-tui/config.toml`
 
 ---
@@ -60,6 +103,16 @@ A terminal user interface (TUI) for GitLab and GitHub, built on top of [`glab`](
 ---
 
 ## Installation
+
+### Package Manager
+
+| Package Manager / Channel | Installation Command |
+|---|---|
+| **Crates.io** | `cargo install glab-tui-crate` |
+| **GitHub Releases (Binaries)** | Manual / Self-update (`glab-tui -u`) |
+| **Homebrew** | `brew install rcieri/glab-tui/glab-tui` |
+| **Scoop (Windows)** | `scoop install glab-tui` |
+| **Docker Container** | `docker run --rm -it ghcr.io/rcieri/glab-tui` |
 
 ### From source
 
@@ -169,7 +222,16 @@ The generated file is fully annotated. Key sections:
 
 ```toml
 # Pick a built-in theme preset
-theme_preset = "default"   # default | tokyo-night | gruvbox | nord | catppuccin-mocha | dracula
+theme_preset = "default"   # default | tokyo-night | gruvbox | nord | catppuccin-mocha | dracula | rose-pine | rose-pine-moon | rose-pine-dawn | clean | ...
+
+# Items per API request (1-100) — lower this if your GitLab instance truncates
+# large JSON response bodies. GitLab-only; GitHub paginates with --limit.
+# api_per_page = 100
+
+# Label colors: use the real colors from `label list` (GitLab/GitHub) when
+# available, falling back to the theme palette. Set to false to always use the
+# theme palette.
+# fetch_label_colors = true
 
 # Override individual colors (takes precedence over theme_preset)
 # [theme]
@@ -203,7 +265,7 @@ edit_entity = "e"
 
 ### Custom themes
 
-Drop any `<name>.toml` file into `~/.config/glab-tui/themes/` and set `theme_preset = "<name>"` in `config.toml`. The file must define the same 19 color tokens as the bundled themes.
+Drop any `<name>.toml` file into `~/.config/glab-tui/themes/` and set `theme_preset = "<name>"` in `config.toml`. The file must define the same 29 color tokens as the bundled themes: the 19 semantic tokens (backgrounds, borders, text, status colors) plus the 10-entry `label_palette_0`…`label_palette_9` used for label and fallback rendering. The theme's `bg` token paints the table backgrounds, popup overlays (edit menus, selectors, confirm dialogs), and the diff view, so custom themes render consistently even on terminals whose default background differs.
 
 ### Editor
 

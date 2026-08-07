@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.3] - 2026-08-04
+
+### Features
+- **Real label colors from the API** — The Labels column now renders each label with its actual color returned by `glab label list` / `gh label list` (hex, normalized and persisted in the offline cache). GitHub-style background-fill colors that are too light to read as foreground text automatically fall back to the theme palette, which now ships full 10-entry palettes across all 16 bundled themes. A new `fetch_label_colors` config option (default `true`) switches back to always using the theme palette (#295).
+- **Complete theme coverage** — Every remaining hardcoded RGB value was replaced with semantic theme tokens so all surfaces honor the active theme: the diff view (unified and side-by-side addition/deletion lines, gutters, separators, empty panes, draft/current comment overlays, file-tree stats), markdown rendering (headings, list bullets, blockquotes, code), and the diff selection/search-match highlight backgrounds (#295).
+
+### Bug Fixes
+- **Windows CI test race** — Unit tests that mutate process-global environment variables (config paths, cache dirs) are now serialized on a shared `config::TEST_ENV_MUTEX`, eliminating an intermittent `page_size` assertion failure on Windows where one test's `GLAB_TUI_CONFIG` mutation leaked into another test's `Config::load()` (#296).
+
+### Maintenance
+- **Release tooling** — `scripts/release.sh` gained animated spinner and progress-bar helpers: preflight checks, release builds, demo-GIF generation, PR-merge polling, and the branch push now run with a live spinner and captured logs (auto-disabled when not a TTY), and release phases are numbered (`1/7` …) for clearer progress reporting (#296).
+- **Documentation** — README package-manager version badges (crates.io, GitHub releases, Homebrew, Scoop, Docker) consolidated into the header badge row, and the Homebrew badge re-pointed at the main repo's release tags (the tap repo publishes no releases of its own).
+- **Dependencies** — `toml` bumped `1.1.3` → `1.1.4` (#292); CI Actions `docker/login-action` `4.5.2` → `4.6.0` (#293) and `actions/stale` `10.4.0` → `11.0.0` (#294).
+
+---
+
+## [0.8.2] - 2026-08-02
+
+### Features
+- **MR/PR review state at a glance** — The MR/PR table now surfaces **Approval** (`CHG`/`CHANGES`, `AWAITING`, `APPROVED`, `REVIEW REQ`), **Mergeable** (`CONFLICT`, `REBASE`, `CLEAN`, `CHECKING`), and **Workflow** (`Returned`, `Review req`, `Yours`, `Approved`, `By others`, `Inactive`) columns with color-coded icon badges, reordered so the status indicators sit together at the front of the table. GitLab state comes from a single bulk GraphQL query; GitHub derives it from the native `gh pr list` review/merge fields. Pending approvals repeat one icon per approval still needed, and GitLab's `blocking_discussions_resolved` flag is surfaced alongside (#270, #274).
+- **Rebase & revoke approvals** — `R` rebases the source branch onto the target on both hosts (gated by mergeability: conflicted MRs must be resolved locally, already-clean MRs are skipped), and `A` revokes your approval on GitLab (`gh` has no revoke path) — both behind the standard confirm popup (#270).
+- **Filter picker aligned with the table** — Value-based column filter selectors now show the exact text the table renders (`OPEN`/`CLOSED`, `CONFLICT`/`REBASE`/`CLEAN`, `SUCCESS`/`FAILED`, …). Legacy lowercase values already saved in `config.toml` or the cache keep working through automatic `normalize_filter_value()` normalization (#274).
+- **`api_per_page` configuration** — New `api_per_page` key bounds the per-request response size (clamped to GitLab's accepted `1–100` `per_page` range) for issues, MRs, pipelines, and labels — a workaround for GitLab instances that truncate large JSON response bodies (#269, #272).
+- **Rosé Pine themes** — Three new bundled presets: `rose-pine`, `rose-pine-moon`, and `rose-pine-dawn` (16 bundled themes total) (#278).
+- **Theme polish** — The root canvas background is now painted for every theme, the `default` and `clean` presets use pure black backgrounds, and the light-theme demo GIF was re-recorded. The hardcoded in-code fallback theme was removed: `Theme::default()` now derives directly from `src/themes/default.toml`, so the bundled TOML is the single source of truth (#282).
+
+### Bug Fixes
+- **Milestone removal & attribute clearing** — Milestones can now be removed (empty / `None` selector value) and attributes cleared from the edit menu and bulk updates, and the premature tab-refresh race after edit submission was eliminated (#281).
+- **Cached filter compatibility** — Pre-existing saved column filters stored with the old lowercase display values are normalized transparently, so no config or cache migration is required after upgrading (#274).
+- **Overlay & diff view backgrounds** — Popup overlays (edit menus, selectors, confirm dialogs, column filters) and the diff view now paint the active theme background instead of resetting to the terminal default color, so every surface renders consistently with the chosen theme on terminals whose default background differs from `bg`.
+
+### Maintenance
+- **Release tooling** — `scripts/release.sh` now interactively selects the opencode model (provider → model → variant) used for regenerated docs and release notes, via `fzf` with a numbered-menu fallback; set `OPENCODE_MODEL` to skip the prompt (#283).
+- **Test robustness** — `workflow_dispatch` input parsing now tests against an inline fixture instead of reading a repository workflow file (#271); new unit tests cover MR keybinding collision detection, bundled-theme parsing, `api_per_page` clamping, MR state derivation, and filter normalization.
+- **Documentation** — Backend docs describe `_per_request` semantics (no-op on GitHub, which paginates via `--limit`), and the generated `config.toml` documents `api_per_page`; the README CI badge now points at `rust.yml` (#272).
+
+---
+
 ## [0.8.1] - 2026-07-31
 
 ### Fixed

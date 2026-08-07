@@ -835,6 +835,13 @@ async fn main() -> Result<()> {
     app.environments.items = cache.environments;
     app.milestone_issues_cache = cache.milestone_issues;
     app.cached_labels = cache.labels;
+    if app.config.fetch_label_colors {
+        app.label_colors = cache
+            .label_colors
+            .iter()
+            .filter_map(|(name, hex)| crate::config::hex_to_color(hex).map(|c| (name.clone(), c)))
+            .collect();
+    }
     app.cached_members = cache.members;
 
     let has_any_cached = !app.issues.items.is_empty()
@@ -1411,7 +1418,13 @@ async fn main() -> Result<()> {
                         }
                         crate::utils::cache::save_cache(&app.project_context, &app.project_cache);
                         if let Some(mut selector) = app.selector.take() {
-                            selector.all_items = items;
+                            if selector.field_type == "milestone" {
+                                let mut ms_items = vec!["None".to_string()];
+                                ms_items.extend(items.into_iter().filter(|i| i != "None"));
+                                selector.all_items = ms_items;
+                            } else {
+                                selector.all_items = items;
+                            }
                             selector.is_loading = false;
                             app.selector = Some(selector);
                         }
@@ -1419,8 +1432,24 @@ async fn main() -> Result<()> {
                 }
                 Event::RepoAttributesFetched { labels, members } => {
                     if !labels.is_empty() {
-                        app.cached_labels = labels.clone();
-                        app.project_cache.labels = labels;
+                        let names: Vec<String> = labels.iter().map(|l| l.name.clone()).collect();
+                        app.cached_labels = names.clone();
+                        app.project_cache.labels = names;
+                        if app.config.fetch_label_colors {
+                            let colors: std::collections::HashMap<String, String> = labels
+                                .iter()
+                                .filter_map(|l| {
+                                    l.color.as_ref().map(|c| (l.name.clone(), c.clone()))
+                                })
+                                .collect();
+                            app.project_cache.label_colors = colors.clone();
+                            app.label_colors = colors
+                                .iter()
+                                .filter_map(|(name, hex)| {
+                                    crate::config::hex_to_color(hex).map(|c| (name.clone(), c))
+                                })
+                                .collect();
+                        }
                     }
                     if !members.is_empty() {
                         app.cached_members = members.clone();
@@ -3871,7 +3900,9 @@ async fn main() -> Result<()> {
                                                     selected_list = vec![query];
                                                 }
                                             }
-                                        } else if !selector.multi_select && selected_list.is_empty()
+                                        } else if !selector.multi_select
+                                            && selected_list.is_empty()
+                                            && selector.field_type != "milestone"
                                         {
                                             selected_list.push(item.clone());
                                         }
@@ -3986,15 +4017,6 @@ async fn main() -> Result<()> {
                                             events.sender(),
                                             active_tab,
                                         );
-
-                                        if let Some(client) = &app.gitlab_client {
-                                            spawn_refresh_active_tab(
-                                                client,
-                                                &app.project_context,
-                                                app.active_tab,
-                                                events.sender(),
-                                            );
-                                        }
 
                                         rebuild_edit_menu(&mut app, &entity_type, entity_iid);
                                     }
@@ -4716,12 +4738,15 @@ async fn main() -> Result<()> {
                                             is_loading = false;
                                         }
                                     } else if field_type == "milestone" {
-                                        all_items = app
-                                            .milestones
-                                            .items
-                                            .iter()
-                                            .map(|m| m.title.clone())
-                                            .collect();
+                                        let mut ms_items = vec!["None".to_string()];
+                                        ms_items.extend(
+                                            app.milestones
+                                                .items
+                                                .iter()
+                                                .map(|m| m.title.clone())
+                                                .filter(|t| t != "None"),
+                                        );
+                                        all_items = ms_items;
                                         is_loading = false;
                                     } else if field_type == "source_branch"
                                         || field_type == "target_branch"
@@ -4929,9 +4954,15 @@ async fn main() -> Result<()> {
                                             let tx = events.sender();
                                             tokio::spawn(async move {
                                                 let res = match field_type.as_str() {
-                                                    "labels" => {
-                                                        client.fetch_labels(&project_context).await
-                                                    }
+                                                    "labels" => client
+                                                        .fetch_labels(&project_context)
+                                                        .await
+                                                        .map(|labels| {
+                                                            labels
+                                                                .into_iter()
+                                                                .map(|l| l.name)
+                                                                .collect()
+                                                        }),
                                                     "assignees" | "reviewers" => {
                                                         client.fetch_members(&project_context).await
                                                     }

@@ -2,6 +2,7 @@ use super::Backend;
 use crate::domain::branches::Branch;
 use crate::domain::deployments::{Deployment, Environment};
 use crate::domain::issues::Issue;
+use crate::domain::labels::Label;
 use crate::domain::milestones::Milestone;
 use crate::domain::mr::{DiscussionNote, MergeRequest};
 use crate::domain::notifications::Notification;
@@ -2494,7 +2495,7 @@ impl Backend for GlabBackend {
 
     // ── Labels / Members / Misc ──
 
-    async fn fetch_labels(&self, project: &str) -> Result<Vec<String>> {
+    async fn fetch_labels(&self, project: &str, per_request: usize) -> Result<Vec<Label>> {
         let raw = self
             .run_glab(
                 &[
@@ -2505,7 +2506,7 @@ impl Backend for GlabBackend {
                     "-R",
                     project,
                     "--per-page",
-                    "100",
+                    &per_request.to_string(),
                 ],
                 "Fetching Labels",
             )
@@ -2513,9 +2514,16 @@ impl Backend for GlabBackend {
         #[derive(Deserialize)]
         struct GiLabel {
             name: String,
+            color: Option<String>,
         }
         let labels: Vec<GiLabel> = serde_json::from_str(&raw)?;
-        Ok(labels.into_iter().map(|l| l.name).collect())
+        Ok(labels
+            .into_iter()
+            .map(|l| Label {
+                name: l.name,
+                color: l.color.map(|c| c.trim_start_matches('#').to_string()),
+            })
+            .collect())
     }
 
     async fn fetch_members(&self, project: &str) -> Result<Vec<String>> {
@@ -2816,9 +2824,9 @@ mod tests {
         assert_eq!(page_count(100, 20), 5);
         assert_eq!(page_count(100, 100), 1);
         assert_eq!(page_count(250, 100), 3);
-        // per_request = 0 must not panic (div_ceil would); clamped to 1 item per
-        // request, so a 100-item budget needs 100 requests.
-        assert_eq!(page_count(100, 0), 100);
+        // value already clamped to 1..=100 by Config::api_per_page_clamped(),
+        // but the max(1) guard in page_count() ensures division safety.
+        assert_eq!(page_count(100, 1), 100);
     }
 
     // ── project path validation (GraphQL injection guard) ──
